@@ -6,6 +6,7 @@
  * @date 2016-03-01
  */
 
+// #define __DBG_ON
 #define __LOG_ON
 
 #include <gtk/gtk.h>
@@ -29,12 +30,16 @@
 
 #include "cmd_list.h"
 
+#define BUFFER_COUNT 10
+
 struct _SrainChat {
     GtkBox parent;
 
-    char *server_name;
+    char *srv_name;
     char *chat_name;
     ChatType type;
+    GList *buffer_list;
+    GList *buffer_ptr;
 
     /* header */
     GtkLabel* name_label;
@@ -55,7 +60,7 @@ struct _SrainChat {
 
     /* input entry */
     GtkLabel *nick_label;
-    GtkEntry *input_entry;
+    GtkTextView *input_text_view;
     SrainEntryCompletion *completion;
     GtkButton *upload_image_button;
 
@@ -102,17 +107,109 @@ static void close_menu_item_on_activate(GtkWidget* widget, gpointer user_data){
 
 }
 
+static int is_blank(const char *str){
+    while (*str){
+        if (*str != '\t' && *str != ' ')
+            return 0;
+        str++;
+    }
+    return 1;
+}
+
+static void input_text_view_on_send(SrainChat *chat){
+    char *input;
+
+    GtkTextIter start, end;
+    GtkTextBuffer *buffer;
+
+    buffer = gtk_text_view_get_buffer(chat->input_text_view);
+    gtk_text_buffer_get_bounds(buffer, &start, &end);
+    input = gtk_text_buffer_get_text(buffer, &start, &end, FALSE);
+
+    if (is_blank(input)) return;
+
+    DBG_FR("text: '%s'", input);
+
+    if (input[0] == '/'){
+        ui_hdr_srv_cmd(
+                srain_chat_get_srv_name(chat),
+                srain_chat_get_chat_name(chat),
+                input, 0);
+    } else {
+        ui_send_msg(
+                srain_chat_get_srv_name(chat),
+                srain_chat_get_chat_name(chat),
+                input, 0);
+        if (ui_hdr_srv_send(
+                    srain_chat_get_srv_name(chat),
+                    srain_chat_get_chat_name(chat),
+                    input) < 0){
+            ui_sys_msg(
+                    srain_chat_get_srv_name(chat),
+                    srain_chat_get_chat_name(chat),
+                    _("Failed to send message"),
+                    SYS_MSG_ERROR, 0);
+        }
+    }
+
+    buffer = gtk_text_buffer_new(NULL);
+    gtk_text_view_set_buffer(chat->input_text_view, buffer);
+
+    int len;
+    if ((len = g_list_length(chat->buffer_list)) >= BUFFER_COUNT){
+        gpointer tmp = g_list_nth_data(chat->buffer_list, len - 1);
+        DBG_FR("Remove GtkTextBuffer 0x%x", tmp);
+        chat->buffer_list = g_list_remove(chat->buffer_list, tmp);
+    }
+    DBG_FR("buffers count: %d", len);
+
+    chat->buffer_list = g_list_prepend(chat->buffer_list, buffer);
+    chat->buffer_ptr = chat->buffer_list;
+    return;
+}
+
+static void input_text_view_prev_buffer(SrainChat *chat){
+    GList *tmp;
+    GtkTextBuffer *buffer;
+
+    tmp = g_list_next(chat->buffer_ptr);
+    if (!tmp) return;
+
+    chat->buffer_ptr = tmp;
+    buffer = chat->buffer_ptr->data;
+    gtk_text_view_set_buffer(chat->input_text_view, buffer);
+}
+
+static void input_text_view_next_buffer(SrainChat *chat){
+    GList *tmp;
+    GtkTextBuffer *buffer;
+
+    tmp = g_list_previous(chat->buffer_ptr);
+    if (!tmp) return;
+
+    chat->buffer_ptr = tmp;
+    buffer = chat->buffer_ptr->data;
+    gtk_text_view_set_buffer(chat->input_text_view, buffer);
+}
+
 static gboolean entry_on_key_press(gpointer user_data, GdkEventKey *event){
     SrainChat *chat;
 
     chat = user_data;
     switch (event->keyval){
         case GDK_KEY_Down:
-            // TODO: use up/down to switch history message?
-            srain_msg_list_scroll_down(chat->msg_list, 30);
+            if (event->state & GDK_CONTROL_MASK){
+                srain_msg_list_scroll_down(chat->msg_list, 30);
+            } else {
+                input_text_view_next_buffer(chat);
+            }
             break;
         case GDK_KEY_Up:
-            srain_msg_list_scroll_up(chat->msg_list, 30);
+            if (event->state & GDK_CONTROL_MASK){
+                srain_msg_list_scroll_up(chat->msg_list, 30);
+            } else {
+                input_text_view_prev_buffer(chat);
+            }
             break;
         case GDK_KEY_Tab:
             srain_entry_completion_complete(chat->completion);
@@ -122,6 +219,9 @@ static gboolean entry_on_key_press(gpointer user_data, GdkEventKey *event){
                 srain_entry_completion_complete(chat->completion);
                 break;
             }
+        case GDK_KEY_Return:
+            input_text_view_on_send(chat);
+            break;
         default:
             return FALSE;
     }
@@ -182,57 +282,11 @@ static void upload_image_button_on_click(GtkWidget *widget, gpointer user_data){
 
 }
 
-static int is_blank(const char *str){
-    while (*str){
-        if (*str != '\t' && *str != ' ')
-            return 0;
-        str++;
-    }
-    return 1;
-}
-
-static void input_entry_on_activate(SrainChat *chat){
-    char *input;
-
-    input = strdup(gtk_entry_get_text(chat->input_entry));
-
-    if (is_blank(input)) goto ret;
-
-    DBG_FR("chat: %s, text: '%s'", chat_name, input);
-
-    if (input[0] == '/'){
-        ui_hdr_srv_cmd(
-                srain_chat_get_srv_name(chat),
-                srain_chat_get_chat_name(chat),
-                input, 0);
-    } else {
-        ui_send_msg(
-                srain_chat_get_srv_name(chat),
-                srain_chat_get_chat_name(chat),
-                input, 0);
-        if (ui_hdr_srv_send(
-                    srain_chat_get_srv_name(chat),
-                    srain_chat_get_chat_name(chat),
-                    input) < 0){
-            ui_sys_msg(
-                    srain_chat_get_srv_name(chat),
-                    srain_chat_get_chat_name(chat),
-                    _("Failed to send message"),
-                    SYS_MSG_ERROR, 0);
-        }
-    }
-
-ret:
-    gtk_entry_set_text(chat->input_entry, "");
-    free(input);
-    return;
-}
-
 static void srain_chat_init(SrainChat *self){
     gtk_widget_init_template(GTK_WIDGET(self));
 
     /* init completion list */
-    self->completion = srain_entry_completion_new(self->input_entry);
+    self->completion = srain_entry_completion_new(self->input_text_view);
 
     /* init user list */
     self->user_list = srain_user_list_new();
@@ -256,13 +310,11 @@ static void srain_chat_init(SrainChat *self){
     g_signal_connect(self->close_menu_item, "activate",
             G_CALLBACK(close_menu_item_on_activate), self);
 
-    g_signal_connect_swapped(self->input_entry, "activate",
-            G_CALLBACK(input_entry_on_activate), self);
-    g_signal_connect_swapped(self->input_entry, "key_press_event",
+    g_signal_connect_swapped(self->input_text_view, "key_press_event",
             G_CALLBACK(entry_on_key_press), self);
 
     g_signal_connect(self->upload_image_button, "clicked",
-            G_CALLBACK(upload_image_button_on_click), self->input_entry);
+            G_CALLBACK(upload_image_button_on_click), self->input_text_view);
 
     /* command completion */
     int i;
@@ -274,7 +326,7 @@ static void srain_chat_init(SrainChat *self){
 }
 
 static void srain_chat_finalize(GObject *object){
-    free(SRAIN_CHAT(object)->server_name);
+    free(SRAIN_CHAT(object)->srv_name);
     free(SRAIN_CHAT(object)->chat_name);
 
     G_OBJECT_CLASS(srain_chat_parent_class)->finalize(object);
@@ -302,23 +354,28 @@ static void srain_chat_class_init(SrainChatClass *class){
     gtk_widget_class_bind_template_child(GTK_WIDGET_CLASS(class), SrainChat, user_list_revealer);
 
     gtk_widget_class_bind_template_child(GTK_WIDGET_CLASS(class), SrainChat, nick_label);
-    gtk_widget_class_bind_template_child(GTK_WIDGET_CLASS(class), SrainChat, input_entry);
+    gtk_widget_class_bind_template_child(GTK_WIDGET_CLASS(class), SrainChat, input_text_view);
     gtk_widget_class_bind_template_child(GTK_WIDGET_CLASS(class), SrainChat, upload_image_button);
 }
 
-SrainChat* srain_chat_new(const char *server_name, const char *chat_name,
+SrainChat* srain_chat_new(const char *srv_name, const char *chat_name,
         ChatType type){
     SrainChat *chat;
+    GtkTextBuffer *buffer;
 
     chat = g_object_new(SRAIN_TYPE_CHAT, NULL);
+    // TODO: what's usage of GtkTextTagTable ?
+    buffer = gtk_text_buffer_new(NULL);
 
     chat->type =type;
+    chat->chat_name = strdup(chat_name);
+    chat->srv_name = strdup(srv_name);
+    chat->buffer_list = g_list_append(chat->buffer_list, buffer);
+    chat->buffer_ptr = chat->buffer_list;
 
     gtk_label_set_text(chat->name_label, chat_name);
     gtk_widget_set_name(GTK_WIDGET(chat), chat_name);
-
-    chat->chat_name = strdup(chat_name);
-    chat->server_name = strdup(server_name);
+    gtk_text_view_set_buffer(chat->input_text_view, buffer);
 
     switch (chat->type){
         case CHAT_SERVER:
@@ -357,19 +414,14 @@ void srain_chat_set_topic(SrainChat *chat, const char *topic){
  * @param pos If the pos = -1, insert at current position
  */
 void srain_chat_insert_text(SrainChat *chat, const char *text, int pos){
-    GtkEntryBuffer *buf;
+    GtkTextBuffer *buf;
 
-    buf = gtk_entry_get_buffer(chat->input_entry);
-    if (pos == -1)
-        pos = gtk_editable_get_position(GTK_EDITABLE(chat->input_entry));
-
-    gtk_entry_buffer_insert_text(buf, pos, text, -1);
-    gtk_editable_set_position(GTK_EDITABLE(chat->input_entry),
-            pos + strlen(text));
+    buf = gtk_text_view_get_buffer(chat->input_text_view);
+    gtk_text_buffer_insert_at_cursor(buf, text, strlen(text));
 }
 
 void srain_chat_fcous_entry(SrainChat *chat){
-    gtk_widget_grab_focus(GTK_WIDGET(chat->input_entry));
+    gtk_widget_grab_focus(GTK_WIDGET(chat->input_text_view));
 }
 
 SrainUserList* srain_chat_get_user_list(SrainChat *chat){
@@ -389,7 +441,7 @@ const char* srain_chat_get_name(SrainChat *chat){
 }
 
 const char* srain_chat_get_srv_name(SrainChat *chat){
-    return chat->server_name;
+    return chat->srv_name;
 }
 
 const char* srain_chat_get_chat_name(SrainChat *chat){
